@@ -11,7 +11,16 @@ import pytest
 
 from rich.console import Console
 from rich.measure import Measurement
-from rich.pretty import Node, Pretty, _ipy_display_hook, install, pprint, pretty_repr
+from rich.pretty import (
+    Node,
+    Pretty,
+    _ipy_display_hook,
+    install,
+    is_expandable,
+    pprint,
+    pretty_repr,
+    traverse,
+)
 from rich.text import Text
 
 skip_py38 = pytest.mark.skipif(
@@ -236,6 +245,42 @@ def test_pretty_namedtuple_length_one_no_trailing_comma() -> None:
     assert pretty_repr(instance) == "Thing(name='Bob')"
 
 
+def test_pretty_collections_namedtuple_formatting() -> None:
+    Thing = collections.namedtuple("Thing", ["name", "values"])
+    instance = Thing(name="Bob", values=[1, 2])
+
+    assert (
+        pretty_repr(instance, max_width=20)
+        == "Thing(\n    name='Bob',\n    values=[1, 2]\n)"
+    )
+
+
+def test_pretty_typing_namedtuple_formatting() -> None:
+    class Thing(NamedTuple):
+        name: str
+        values: List[int]
+
+    instance = Thing(name="Bob", values=[1, 2])
+
+    assert (
+        pretty_repr(instance, max_width=20)
+        == "Thing(\n    name='Bob',\n    values=[1, 2]\n)"
+    )
+
+
+def test_pretty_namedtuple_subclass_inherits_fields() -> None:
+    Base = collections.namedtuple("Base", ["value"])
+
+    class Derived(Base):
+        pass
+
+    instance = Derived(1)
+    node = traverse(instance)
+
+    assert node.is_namedtuple
+    assert pretty_repr(instance) == "Derived(value=1)"
+
+
 def test_pretty_namedtuple_empty() -> None:
     instance = collections.namedtuple("Thing", [])()
     assert pretty_repr(instance) == "Thing()"
@@ -255,7 +300,214 @@ def test_pretty_namedtuple_fields_invalid_type() -> None:
 
     instance = LooksLikeANamedTupleButIsnt()
     result = pretty_repr(instance)
+    node = traverse(instance)
+
     assert result == "()"  # Treated as tuple
+    assert not node.is_namedtuple
+
+
+def test_pretty_does_not_probe_dynamic_getattr() -> None:
+    class AutoVivifying:
+        def __init__(self):
+            self.accessed = []
+
+        def __getattr__(self, name):
+            self.accessed.append(name)
+            value = object()
+            setattr(self, name, value)
+            return value
+
+        def __repr__(self):
+            return "AutoVivifying()"
+
+    instance = AutoVivifying()
+
+    result = pretty_repr(instance)
+
+    assert instance.accessed == []
+    assert set(instance.__dict__) == {"accessed"}
+    assert result == "AutoVivifying()"
+
+
+def test_is_expandable_does_not_probe_dynamic_getattr() -> None:
+    accessed = []
+
+    class AutoVivifying:
+        def __getattr__(self, name):
+            accessed.append(name)
+            raise AttributeError(name)
+
+    result = is_expandable(AutoVivifying())
+
+    assert not accessed
+    assert not result
+
+
+def test_pretty_preserves_instance_rich_repr() -> None:
+    class Thing:
+        def __init__(self):
+            self.__rich_repr__ = lambda: [("value", 1)]
+
+        def __repr__(self):
+            return "Thing()"
+
+    assert pretty_repr(Thing()) == "Thing(value=1)"
+
+
+def test_pretty_preserves_class_rich_repr_with_dynamic_getattr() -> None:
+    class Thing:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+        def __rich_repr__(self):
+            yield "value", 1
+
+        def __repr__(self):
+            return "fallback"
+
+    assert pretty_repr(Thing()) == "Thing(value=1)"
+
+
+def test_pretty_does_not_probe_dynamic_getattribute() -> None:
+    accessed = []
+
+    class AutoVivifying:
+        def __getattribute__(self, name):
+            if name == "__class__":
+                accessed.append(name)
+                return object.__getattribute__(self, name)
+            if name == "accessed":
+                return accessed
+            value = object()
+            object.__setattr__(self, name, value)
+            return value
+
+        def __repr__(self):
+            return "AutoVivifying()"
+
+    instance = AutoVivifying()
+
+    result = pretty_repr(instance)
+
+    assert accessed == []
+    assert object.__getattribute__(instance, "__dict__") == {}
+    assert result == "AutoVivifying()"
+
+
+def test_pretty_does_not_treat_dynamic_fields_as_namedtuple() -> None:
+    class DynamicTuple(tuple):
+        def __getattr__(self, name):
+            value = () if name == "_fields" else object()
+            setattr(self, name, value)
+            return value
+
+    instance = DynamicTuple((1, 2))
+    result = traverse(instance)
+
+    assert pretty_repr(instance) == "(1, 2)"
+    assert not result.is_namedtuple
+    assert instance.__dict__ == {}
+
+
+def test_pretty_does_not_treat_dynamic_getattribute_fields_as_namedtuple() -> None:
+    class DynamicTuple(tuple):
+        def __getattribute__(self, name):
+            if name == "_fields":
+                return ()
+            return object.__getattribute__(self, name)
+
+    instance = DynamicTuple((1, 2))
+    result = traverse(instance)
+
+    assert pretty_repr(instance) == "(1, 2)"
+    assert not result.is_namedtuple
+    assert instance.__dict__ == {}
+
+
+def test_pretty_does_not_invoke_fields_descriptor() -> None:
+    accessed = []
+
+    class DescriptorTuple(tuple):
+        @property
+        def _fields(self):
+            accessed.append("_fields")
+            return ()
+
+    instance = DescriptorTuple((1, 2))
+    result = traverse(instance)
+
+    assert not result.is_namedtuple
+    assert accessed == []
+    assert pretty_repr(instance) == "(1, 2)"
+
+
+def test_pretty_handles_slots_with_dynamic_getattr() -> None:
+    accessed = []
+
+    class Slotted:
+        __slots__ = ()
+
+        def __getattr__(self, name):
+            accessed.append(name)
+            raise AttributeError(name)
+
+        def __repr__(self):
+            return "Slotted()"
+
+    result = pretty_repr(Slotted())
+
+    assert not accessed
+    assert result == "Slotted()"
+
+
+def test_pretty_does_not_mutate_mapping_backed_attributes() -> None:
+    class MappingBacked(dict):
+        def __getattr__(self, name):
+            self[name] = object()
+            return self[name]
+
+    instance = MappingBacked()
+    result = pretty_repr(instance)
+
+    assert dict(instance) == {}
+    assert result == "{}"
+
+
+def test_pretty_handles_failing_getattribute() -> None:
+    class BrokenAttribute:
+        def __getattribute__(self, name):
+            raise RuntimeError(f"attribute lookup failed: {name}")
+
+        def __repr__(self):
+            return "BrokenAttribute()"
+
+    assert pretty_repr(BrokenAttribute()) == "BrokenAttribute()"
+
+
+def test_is_expandable_handles_failing_getattribute() -> None:
+    class BrokenAttribute:
+        def __getattribute__(self, name):
+            raise RuntimeError(f"attribute lookup failed: {name}")
+
+        def __rich_repr__(self):
+            yield "value", 1
+
+        def __repr__(self):
+            return "BrokenAttribute()"
+
+    assert is_expandable(BrokenAttribute())
+
+
+def test_pretty_handles_failing_namedtuple_attribute_hook() -> None:
+    class BrokenNamedTuple(NamedTuple):
+        value: int
+
+        def __getattribute__(self, name):
+            if name == "_asdict":
+                raise RuntimeError("attribute lookup failed")
+            return object.__getattribute__(self, name)
+
+    assert pretty_repr(BrokenNamedTuple(1)) == "BrokenNamedTuple(value=1)"
 
 
 def test_pretty_namedtuple_max_depth() -> None:
