@@ -468,6 +468,22 @@ def test_failing_rich_repr_iterator_falls_back_to_repr() -> None:
     assert accessed == ["call", "iterate"]
 
 
+@pytest.mark.parametrize(
+    "item",
+    [(("value", 1, 2, 3),), ((1, 1),)],
+    ids=["wrong-arity", "non-string-key"],
+)
+def test_malformed_rich_repr_falls_back_to_repr(item: Any) -> None:
+    class MalformedRepresentation:
+        def __rich_repr__(self):
+            yield from item
+
+        def __repr__(self) -> str:
+            return "MalformedRepresentation()"
+
+    assert pretty_repr(MalformedRepresentation()) == "MalformedRepresentation()"
+
+
 def test_dynamic_rich_repr_is_not_probed() -> None:
     """Dynamic protocol synthesis must not run during pretty introspection."""
 
