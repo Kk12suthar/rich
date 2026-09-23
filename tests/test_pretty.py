@@ -3,8 +3,8 @@ import io
 import sys
 from array import array
 from collections import UserDict, defaultdict, deque
-from dataclasses import dataclass, field
-from typing import Any, List, NamedTuple
+from dataclasses import InitVar, dataclass, field
+from typing import Any, ClassVar, List, NamedTuple
 
 import attr
 import pytest
@@ -550,6 +550,122 @@ def test_instance_rich_repr_remains_supported() -> None:
             self.__rich_repr__ = lambda: [("value", 8)]
 
     assert pretty_repr(InstanceRepresentation()) == "InstanceRepresentation(value=8)"
+
+
+@pytest.mark.parametrize(
+    "decorate", [dataclass, attr.define(slots=False)], ids=["dataclass", "attrs"]
+)
+@pytest.mark.parametrize("fail", [False, True], ids=["value", "error"])
+def test_declared_field_getattr_is_read_once(decorate: Any, fail: bool) -> None:
+    accessed = []
+
+    @decorate
+    class Example:
+        value: int
+
+        def __getattr__(self, name: str) -> int:
+            accessed.append(name)
+            if name != "value":
+                raise AttributeError(name)
+            if fail:
+                raise RuntimeError("field failed")
+            return 7
+
+    instance = Example(1)
+    del instance.value
+    expected = "RuntimeError('field failed')" if fail else "7"
+    assert pretty_repr(instance) == f"Example(value={expected})"
+    assert accessed == ["value"]
+
+
+@pytest.mark.parametrize(
+    "decorate", [dataclass, attr.define(slots=False)], ids=["dataclass", "attrs"]
+)
+@pytest.mark.parametrize("fail", [False, True], ids=["value", "error"])
+def test_declared_field_descriptor_is_read_once(decorate: Any, fail: bool) -> None:
+    accessed = []
+
+    @decorate
+    class Example:
+        value: int
+
+    def read_value(instance: Any) -> int:
+        accessed.append("value")
+        if fail:
+            raise RuntimeError("field failed")
+        return 7
+
+    instance = Example(1)
+    # A data descriptor takes precedence over the stored field value.
+    Example.value = property(read_value)
+    expected = "RuntimeError('field failed')" if fail else "7"
+    assert pretty_repr(instance) == f"Example(value={expected})"
+    assert accessed == ["value"]
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["missing", "deleted"])
+def test_dict_backed_attrs_missing_field_displays_error(deleted: bool) -> None:
+    @attr.define(slots=False)
+    class Example:
+        value: int = attr.field(init=False)
+
+    instance = Example()
+    if deleted:
+        instance.value = 1
+        del instance.value
+
+    # AttributeError's message includes the qualified class name on Python 3.13+.
+    with pytest.raises(AttributeError) as error:
+        instance.value
+    assert pretty_repr(instance, max_width=200) == f"Example(value={error.value!r})"
+
+
+def test_dataclass_shadowed_dict_preserves_fields() -> None:
+    @dataclass
+    class Example:
+        __dict__: dict
+        value: int = 1
+
+    assert pretty_repr(Example({})) == "Example(__dict__={'value': 1}, value=1)"
+
+
+def test_dataclass_filters_fields_before_reading() -> None:
+    accessed = []
+
+    @dataclass
+    class Example:
+        value: int
+        init_only: InitVar[int] = 2
+        class_only: ClassVar[int] = 3
+        hidden: int = field(default=4, repr=False)
+
+        def __getattribute__(self, name: str) -> Any:
+            accessed.append(name)
+            return object.__getattribute__(self, name)
+
+    assert pretty_repr(Example(1)) == "Example(value=1)"
+    assert accessed == ["value"]
+
+
+def test_dict_backed_instance_rich_repr_remains_supported() -> None:
+    accessed = []
+
+    class InstanceRepresentation:
+        def __getattr__(self, name: str) -> Any:
+            accessed.append(name)
+            raise AttributeError(name)
+
+    def rich_repr():
+        accessed.append("call")
+        yield "value", 8
+
+    instance = InstanceRepresentation()
+    instance.__rich_repr__ = rich_repr
+    assert vars(instance)["__rich_repr__"] is rich_repr
+    assert is_expandable(instance)
+    assert accessed == []
+    assert pretty_repr(instance) == "InstanceRepresentation(value=8)"
+    assert accessed == ["call"]
 
 
 def test_pretty_namedtuple_max_depth() -> None:
