@@ -333,7 +333,7 @@ def test_pretty_repr_does_not_execute_failing_getattribute() -> None:
             return "FailingGetattribute()"
 
     assert pretty_repr(FailingGetattribute()) == "FailingGetattribute()"
-    assert accessed == ["__class__"]
+    assert accessed == []
 
 
 def test_pretty_repr_supports_slots_without_dynamic_access() -> None:
@@ -540,6 +540,16 @@ def test_custom_rich_repr_is_still_used_for_nested_values() -> None:
         "CustomRepresentation(values={'nested': [1, 2]})"
     )
     assert accessed == []
+
+
+def test_instance_rich_repr_remains_supported() -> None:
+    class InstanceRepresentation:
+        __slots__ = ("__rich_repr__",)
+
+        def __init__(self) -> None:
+            self.__rich_repr__ = lambda: [("value", 8)]
+
+    assert pretty_repr(InstanceRepresentation()) == "InstanceRepresentation(value=8)"
 
 
 def test_pretty_namedtuple_max_depth() -> None:

@@ -7,7 +7,7 @@ import reprlib
 import sys
 from array import array
 from collections import Counter, UserDict, UserList, defaultdict, deque
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from itertools import islice
 from types import MappingProxyType
 from typing import (
@@ -24,6 +24,7 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 
@@ -55,20 +56,41 @@ if TYPE_CHECKING:
     )
 
 
+_MISSING = object()
+_TYPE_MRO_GET = cast(Any, type.__dict__["__mro__"].__get__)  # type: ignore[index]
+_TYPE_DICT_GET = cast(Any, type.__dict__["__dict__"].__get__)  # type: ignore[index]
+
+
+def _get_class_attribute(obj_type: type, name: str, default: Any = _MISSING) -> Any:
+    """Get an inherited class attribute without invoking descriptors."""
+    try:
+        for base in _TYPE_MRO_GET(obj_type, type):
+            namespace = _TYPE_DICT_GET(base, type)
+            if name in namespace:
+                return namespace[name]
+    except Exception:
+        pass
+    return default
+
+
 def _is_attr_object(obj: Any) -> bool:
     """Check if an object was created with attrs module."""
     try:
-        return _has_attrs and _attr_module.has(type(obj))
+        return _has_attrs and _safe_isinstance_concrete(
+            _get_class_attribute(type(obj), "__attrs_attrs__"), tuple
+        )
     except Exception:
         return False
 
 
 def _get_attr_fields(obj: Any) -> Sequence["_attr_module.Attribute[Any]"]:
     """Get fields for an attrs object."""
-    return _attr_module.fields(type(obj)) if _has_attrs else []
-
-
-_MISSING = object()
+    if not _has_attrs:
+        return []
+    attr_fields = _get_class_attribute(type(obj), "__attrs_attrs__", _MISSING)
+    if not _safe_isinstance_concrete(attr_fields, tuple):
+        return []
+    return tuple(tuple.__iter__(attr_fields))
 
 
 def _get_static_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
@@ -77,19 +99,6 @@ def _get_static_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
         return inspect.getattr_static(obj, name)
     except Exception:
         return default
-
-
-def _get_class_attribute(obj_type: type, name: str, default: Any = _MISSING) -> Any:
-    """Get an inherited class attribute without invoking descriptors."""
-    try:
-        mro = type.__getattribute__(obj_type, "__mro__")
-        for base in mro:
-            namespace = type.__getattribute__(base, "__dict__")
-            if name in namespace:
-                return namespace[name]
-    except Exception:
-        pass
-    return default
 
 
 def _get_class_name(obj: Any) -> str:
@@ -114,6 +123,18 @@ def _is_dataclass(obj: Any) -> bool:
     target = obj if _is_class(obj) else type(obj)
     return (
         _get_class_attribute(target, "__dataclass_fields__", _MISSING) is not _MISSING
+    )
+
+
+def _get_dataclass_fields(obj: Any) -> Sequence[Any]:
+    """Get dataclass fields without dynamically reading class metadata."""
+    dataclass_fields = _get_class_attribute(type(obj), "__dataclass_fields__", _MISSING)
+    if not _safe_isinstance_concrete(dataclass_fields, dict):
+        return ()
+    return tuple(
+        field
+        for field in dict.values(dataclass_fields)
+        if getattr(field, "_field_type", None) is getattr(dataclasses, "_FIELD")
     )
 
 
@@ -227,10 +248,7 @@ def _safe_isinstance_concrete(
 ) -> bool:
     """Check concrete types without invoking an object's instance hooks."""
     try:
-        obj_type = type(obj)
-        if isinstance(class_or_tuple, tuple):
-            return any(issubclass(obj_type, cls) for cls in class_or_tuple)
-        return issubclass(obj_type, class_or_tuple)
+        return issubclass(type(obj), class_or_tuple)
     except Exception:
         return False
 
@@ -646,20 +664,6 @@ def _get_namedtuple_fields(obj: Any) -> Optional[Tuple[str, ...]]:
     return field_names
 
 
-def _is_namedtuple(obj: Any) -> bool:
-    """Checks if an object is most likely a namedtuple. It is possible
-    to craft an object that passes this check and isn't a namedtuple, but
-    there is only a minuscule chance of this happening unintentionally.
-
-    Args:
-        obj (Any): The object to test
-
-    Returns:
-        bool: True if the object is a namedtuple. False otherwise.
-    """
-    return _get_namedtuple_fields(obj) is not None
-
-
 def traverse(
     _object: Any,
     max_length: Optional[int] = None,
@@ -685,7 +689,7 @@ def traverse(
         """Get repr string for an object, but catch errors."""
         if (
             max_string is not None
-            and _safe_isinstance(obj, (bytes, str))
+            and _safe_isinstance_concrete(obj, (bytes, str))
             and len(obj) > max_string
         ):
             truncated = len(obj) - max_string
@@ -713,23 +717,33 @@ def traverse(
         children: List[Node]
         reached_max_depth = max_depth is not None and depth >= max_depth
 
-        def iter_rich_args(rich_args: Any) -> Iterable[Union[Any, Tuple[str, Any]]]:
+        def iter_rich_args(
+            rich_args: Any,
+        ) -> Iterable[Union[Any, Tuple[Optional[str], Any]]]:
             for arg in rich_args:
                 if _safe_isinstance(arg, tuple):
-                    if len(arg) == 3:
-                        key, child, default = arg
+                    arg_length = tuple.__len__(arg)
+                    if arg_length == 3:
+                        key = tuple.__getitem__(arg, 0)
+                        child = tuple.__getitem__(arg, 1)
+                        default = tuple.__getitem__(arg, 2)
                         if default == child:
                             continue
-                        yield key, child
-                    elif len(arg) == 2:
-                        key, child = arg
-                        yield key, child
-                    elif len(arg) == 1:
-                        yield arg[0]
+                    elif arg_length == 2:
+                        key = tuple.__getitem__(arg, 0)
+                        child = tuple.__getitem__(arg, 1)
+                    elif arg_length == 1:
+                        yield tuple.__getitem__(arg, 0)
+                        continue
+                    else:
+                        raise ValueError("invalid __rich_repr__ argument")
+                    if key is not None and not _safe_isinstance(key, str):
+                        raise ValueError("invalid __rich_repr__ key")
+                    yield key, child
                 else:
                     yield arg
 
-        rich_repr_args: Optional[List[Union[Any, Tuple[str, Any]]]] = None
+        rich_repr_args: Optional[List[Union[Any, Tuple[Optional[str], Any]]]] = None
         rich_repr_method: Any = None
         if (
             not _is_class(obj)
@@ -742,7 +756,11 @@ def traverse(
             except Exception:
                 pass
 
-        namedtuple_fields = _get_namedtuple_fields(obj)
+        namedtuple_fields = (
+            _get_namedtuple_fields(obj)
+            if _safe_isinstance_concrete(obj, tuple)
+            else None
+        )
 
         if rich_repr_args is not None:
             push_visited(obj_id)
@@ -783,8 +801,9 @@ def traverse(
                             key, child = arg
                             child_node = _traverse(child, depth=depth + 1)
                             child_node.last = last
-                            child_node.key_repr = key
-                            child_node.key_separator = "="
+                            if key is not None:
+                                child_node.key_repr = key
+                                child_node.key_separator = "="
                             append(child_node)
                         else:
                             child_node = _traverse(arg, depth=depth + 1)
@@ -824,13 +843,7 @@ def traverse(
                         for attr in attr_fields:
                             if attr.repr:
                                 try:
-                                    if (
-                                        _get_static_attribute(obj, attr.name, _MISSING)
-                                        is _MISSING
-                                    ):
-                                        value = object.__getattribute__(obj, attr.name)
-                                    else:
-                                        value = getattr(obj, attr.name)
+                                    value = getattr(obj, attr.name)
                                 except Exception as error:
                                     # Can happen, albeit rarely
                                     yield (attr.name, error, None)
@@ -870,23 +883,14 @@ def traverse(
                     empty=f"{_get_class_name(obj)}()",
                 )
 
-                try:
-                    dataclass_fields = fields(type(obj))
-                except Exception:
-                    dataclass_fields = ()
+                dataclass_fields = _get_dataclass_fields(obj)
 
                 def iter_dataclass_fields() -> Iterable[Tuple[Any, Any]]:
                     for field in dataclass_fields:
                         if not field.repr:
                             continue
                         try:
-                            if (
-                                _get_static_attribute(obj, field.name, _MISSING)
-                                is _MISSING
-                            ):
-                                value = object.__getattribute__(obj, field.name)
-                            else:
-                                value = getattr(obj, field.name)
+                            value = getattr(obj, field.name)
                         except AttributeError:
                             continue
                         yield field, value
@@ -1018,7 +1022,7 @@ def pretty_repr(
         str: A possibly multi-line representation of the object.
     """
 
-    if _safe_isinstance(_object, Node):
+    if _safe_isinstance_concrete(_object, Node):
         node = _object
     else:
         node = traverse(
