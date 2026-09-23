@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Avoided mutating objects during pretty-print introspection and false named-tuple detection https://github.com/Textualize/rich/issues/4183
+- Avoided speculative attribute probes that could mutate objects during pretty-print introspection, and hardened named-tuple detection https://github.com/Textualize/rich/issues/4183
 
 ## [15.0.0] - 2026-04-12
 

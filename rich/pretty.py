@@ -9,7 +9,7 @@ from array import array
 from collections import Counter, UserDict, UserList, defaultdict, deque
 from dataclasses import dataclass
 from itertools import islice
-from types import MappingProxyType
+from types import MappingProxyType, MethodType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -101,6 +101,26 @@ def _get_static_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
         return default
 
 
+def _get_static_instance_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
+    """Get an instance or class attribute without invoking user hooks."""
+    try:
+        instance_dict = object.__getattribute__(obj, "__dict__")
+    except Exception:
+        instance_dict = None
+    if type(instance_dict) is dict and name in instance_dict:
+        return dict.__getitem__(instance_dict, name)
+    return _get_class_attribute(type(obj), name, default)
+
+
+def _get_angular(method: Any) -> bool:
+    """Read Rich's angular marker without invoking a callable's ``__getattr__``."""
+    angular = _get_static_instance_attribute(method, "angular", _MISSING)
+    if angular is _MISSING and type(method) is MethodType:
+        function = method.__func__
+        angular = _get_static_instance_attribute(function, "angular", _MISSING)
+    return angular if type(angular) is bool else False
+
+
 def _get_class_name(obj: Any) -> str:
     """Get an object's class name without accessing ``obj.__class__``."""
     try:
@@ -150,7 +170,7 @@ def _is_dataclass_repr(obj: object) -> bool:
     # Digging in to a lot of internals here
     # Catching all exceptions in case something is missing on a non CPython implementation
     try:
-        repr_method = _get_static_attribute(type(obj), "__repr__")
+        repr_method = _get_class_attribute(type(obj), "__repr__")
         code = getattr(repr_method, "__code__", None)
         filename = getattr(code, "co_filename", None)
         return filename in (
@@ -175,7 +195,7 @@ def _has_default_namedtuple_repr(obj: object) -> bool:
     """
     obj_file = None
     try:
-        obj_repr = _get_static_attribute(type(obj), "__repr__")
+        obj_repr = _get_class_attribute(type(obj), "__repr__")
         obj_file = inspect.getfile(obj_repr)
     except (OSError, TypeError):
         # OSError handles case where object is defined in __main__ scope, e.g. REPL - no filename available.
@@ -478,6 +498,7 @@ _BRACES: Dict[type, Callable[[Any], Tuple[str, str, str]]] = {
 }
 _CONTAINERS = tuple(_BRACES.keys())
 _MAPPING_CONTAINERS = (dict, os._Environ, MappingProxyType, UserDict)
+_ATOMIC_LEAF_TYPES = (type(None), bool, int, float, complex, bytes, str)
 
 
 def is_expandable(obj: Any) -> bool:
@@ -485,7 +506,8 @@ def is_expandable(obj: Any) -> bool:
     return (
         _safe_isinstance_concrete(obj, _CONTAINERS)
         or _is_dataclass(obj)
-        or _get_static_attribute(obj, "__rich_repr__", _MISSING) is not _MISSING
+        or _get_static_instance_attribute(obj, "__rich_repr__", _MISSING)
+        is not _MISSING
         or _is_attr_object(obj)
     ) and not _is_class(obj)
 
@@ -714,6 +736,8 @@ def traverse(
             return Node(value_repr="...")
 
         obj_type = type(obj)
+        if obj_type in _ATOMIC_LEAF_TYPES:
+            return Node(value_repr=to_repr(obj), last=root)
         children: List[Node]
         reached_max_depth = max_depth is not None and depth >= max_depth
 
@@ -747,7 +771,8 @@ def traverse(
         rich_repr_method: Any = None
         if (
             not _is_class(obj)
-            and _get_static_attribute(obj, "__rich_repr__", _MISSING) is not _MISSING
+            and _get_static_instance_attribute(obj, "__rich_repr__", _MISSING)
+            is not _MISSING
         ):
             try:
                 rich_repr_method = getattr(obj, "__rich_repr__")
@@ -765,7 +790,7 @@ def traverse(
         if rich_repr_args is not None:
             push_visited(obj_id)
             try:
-                angular = getattr(rich_repr_method, "angular", False)
+                angular = _get_angular(rich_repr_method)
             except Exception:
                 angular = False
             args = rich_repr_args

@@ -447,6 +447,38 @@ def test_declared_rich_repr_descriptor_is_bound_only_when_rendered() -> None:
     assert accessed == ["bind", "call"]
 
 
+def test_rich_repr_angular_probe_does_not_mutate_callable() -> None:
+    class CallableRepresentation:
+        def __call__(self):
+            return [("value", 1)]
+
+        def __getattr__(self, name: str) -> bool:
+            if name == "angular":
+                setattr(self, name, False)
+                raise AssertionError("angular was dynamically accessed")
+            raise AttributeError(name)
+
+    class Representation:
+        __rich_repr__ = CallableRepresentation()
+
+    assert pretty_repr(Representation()) == "Representation(value=1)"
+    assert "angular" not in vars(Representation.__rich_repr__)
+
+
+def test_rich_repr_survives_hostile_metaclass_dict_access() -> None:
+    class Meta(type):
+        def __getattribute__(cls, name: str) -> Any:
+            if name == "__dict__":
+                raise AssertionError("metaclass dictionary was accessed")
+            return super().__getattribute__(name)
+
+    class Representation(metaclass=Meta):
+        def __rich_repr__(self):
+            yield "value", 1
+
+    assert pretty_repr(Representation()) == "Representation(value=1)"
+
+
 def test_failing_rich_repr_iterator_falls_back_to_repr() -> None:
     accessed = []
 
