@@ -465,6 +465,38 @@ def test_rich_repr_angular_probe_does_not_mutate_callable() -> None:
     assert "angular" not in vars(Representation.__rich_repr__)
 
 
+def test_slot_angular_marker_remains_supported() -> None:
+    class CallableRepresentation:
+        __slots__ = ("angular",)
+
+        def __init__(self) -> None:
+            self.angular = True
+
+        def __call__(self):
+            return [("value", 1)]
+
+    class Representation:
+        __rich_repr__ = CallableRepresentation()
+
+    assert pretty_repr(Representation()) == "<Representation value=1>"
+
+
+def test_static_probe_does_not_execute_a_dict_descriptor() -> None:
+    accessed = []
+
+    class Representation:
+        @property
+        def __dict__(self) -> dict:
+            accessed.append("__dict__")
+            return {}
+
+        def __rich_repr__(self):
+            yield "value", 1
+
+    assert pretty_repr(Representation()) == "Representation(value=1)"
+    assert accessed == []
+
+
 def test_rich_repr_survives_hostile_metaclass_dict_access() -> None:
     class Meta(type):
         def __getattribute__(cls, name: str) -> Any:
@@ -477,6 +509,19 @@ def test_rich_repr_survives_hostile_metaclass_dict_access() -> None:
             yield "value", 1
 
     assert pretty_repr(Representation()) == "Representation(value=1)"
+
+
+def test_container_repr_probe_survives_hostile_metaclass() -> None:
+    class Meta(type):
+        def __getattribute__(cls, name: str) -> Any:
+            if name == "__repr__":
+                raise AssertionError("metaclass repr was accessed")
+            return super().__getattribute__(name)
+
+    class Values(list, metaclass=Meta):
+        pass
+
+    assert pretty_repr(Values([1])) == "[1]"
 
 
 def test_failing_rich_repr_iterator_falls_back_to_repr() -> None:

@@ -9,7 +9,12 @@ from array import array
 from collections import Counter, UserDict, UserList, defaultdict, deque
 from dataclasses import dataclass
 from itertools import islice
-from types import MappingProxyType, MethodType
+from types import (
+    GetSetDescriptorType,
+    MappingProxyType,
+    MemberDescriptorType,
+    MethodType,
+)
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -96,7 +101,11 @@ def _get_attr_fields(obj: Any) -> Sequence["_attr_module.Attribute[Any]"]:
 def _get_static_instance_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
     """Get an instance or class attribute without invoking user hooks."""
     try:
-        instance_dict = object.__getattribute__(obj, "__dict__")
+        dict_descriptor = _get_class_attribute(type(obj), "__dict__", _MISSING)
+        if type(dict_descriptor) is GetSetDescriptorType:
+            instance_dict = object.__getattribute__(obj, "__dict__")
+        else:
+            instance_dict = None
     except Exception:
         instance_dict = None
     if type(instance_dict) is dict and name in instance_dict:
@@ -107,6 +116,11 @@ def _get_static_instance_attribute(obj: Any, name: str, default: Any = _MISSING)
 def _get_angular(method: Any) -> bool:
     """Read Rich's angular marker without invoking a callable's ``__getattr__``."""
     angular = _get_static_instance_attribute(method, "angular", _MISSING)
+    if type(angular) is MemberDescriptorType:
+        try:
+            angular = angular.__get__(method, type(method))
+        except Exception:
+            angular = _MISSING
     if angular is _MISSING and type(method) is MethodType:
         function = method.__func__
         angular = _get_static_instance_attribute(function, "angular", _MISSING)
@@ -967,7 +981,9 @@ def traverse(
 
             if reached_max_depth:
                 node = Node(value_repr=f"{open_brace}...{close_brace}")
-            elif obj_type.__repr__ != type(obj).__repr__:
+            elif _get_class_attribute(
+                obj_type, "__repr__", _MISSING
+            ) != _get_class_attribute(type(obj), "__repr__", _MISSING):
                 node = Node(value_repr=to_repr(obj), last=root)
             elif obj:
                 children = []
