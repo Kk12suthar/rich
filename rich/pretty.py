@@ -7,8 +7,7 @@ import reprlib
 import sys
 from array import array
 from collections import Counter, UserDict, UserList, defaultdict, deque
-from dataclasses import dataclass, fields, is_dataclass
-from inspect import isclass
+from dataclasses import dataclass, fields
 from itertools import islice
 from types import MappingProxyType
 from typing import (
@@ -27,7 +26,6 @@ from typing import (
     Union,
 )
 
-from rich.repr import RichReprResult
 
 try:
     import attr as _attr_module
@@ -59,12 +57,64 @@ if TYPE_CHECKING:
 
 def _is_attr_object(obj: Any) -> bool:
     """Check if an object was created with attrs module."""
-    return _has_attrs and _attr_module.has(type(obj))
+    try:
+        return _has_attrs and _attr_module.has(type(obj))
+    except Exception:
+        return False
 
 
 def _get_attr_fields(obj: Any) -> Sequence["_attr_module.Attribute[Any]"]:
     """Get fields for an attrs object."""
     return _attr_module.fields(type(obj)) if _has_attrs else []
+
+
+_MISSING = object()
+
+
+def _get_static_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
+    """Get an attribute without invoking descriptors or instance hooks."""
+    try:
+        return inspect.getattr_static(obj, name)
+    except Exception:
+        return default
+
+
+def _get_class_attribute(obj_type: type, name: str, default: Any = _MISSING) -> Any:
+    """Get an inherited class attribute without invoking descriptors."""
+    try:
+        mro = type.__getattribute__(obj_type, "__mro__")
+        for base in mro:
+            namespace = type.__getattribute__(base, "__dict__")
+            if name in namespace:
+                return namespace[name]
+    except Exception:
+        pass
+    return default
+
+
+def _get_class_name(obj: Any) -> str:
+    """Get an object's class name without accessing ``obj.__class__``."""
+    try:
+        class_name = type.__getattribute__(type(obj), "__name__")
+    except Exception:
+        return "<unknown>"
+    return class_name if isinstance(class_name, str) else "<unknown>"
+
+
+def _is_class(obj: Any) -> bool:
+    """Check if an object is a class without consulting its ``__class__``."""
+    try:
+        return issubclass(type(obj), type)
+    except Exception:
+        return False
+
+
+def _is_dataclass(obj: Any) -> bool:
+    """Check for dataclass metadata without invoking instance hooks."""
+    target = obj if _is_class(obj) else type(obj)
+    return (
+        _get_class_attribute(target, "__dataclass_fields__", _MISSING) is not _MISSING
+    )
 
 
 def _is_dataclass_repr(obj: object) -> bool:
@@ -79,7 +129,10 @@ def _is_dataclass_repr(obj: object) -> bool:
     # Digging in to a lot of internals here
     # Catching all exceptions in case something is missing on a non CPython implementation
     try:
-        return obj.__repr__.__code__.co_filename in (
+        repr_method = _get_static_attribute(type(obj), "__repr__")
+        code = getattr(repr_method, "__code__", None)
+        filename = getattr(code, "co_filename", None)
+        return filename in (
             dataclasses.__file__,
             reprlib.__file__,
         )
@@ -101,7 +154,8 @@ def _has_default_namedtuple_repr(obj: object) -> bool:
     """
     obj_file = None
     try:
-        obj_file = inspect.getfile(obj.__repr__)
+        obj_repr = _get_static_attribute(type(obj), "__repr__")
+        obj_file = inspect.getfile(obj_repr)
     except (OSError, TypeError):
         # OSError handles case where object is defined in __main__ scope, e.g. REPL - no filename available.
         # TypeError trapped defensively, in case of object without filename slips through.
@@ -164,6 +218,19 @@ def _safe_isinstance(
     """isinstance can fail in rare cases, for example types with no __class__"""
     try:
         return isinstance(obj, class_or_tuple)
+    except Exception:
+        return False
+
+
+def _safe_isinstance_concrete(
+    obj: object, class_or_tuple: Union[type, Tuple[type, ...]]
+) -> bool:
+    """Check concrete types without invoking an object's instance hooks."""
+    try:
+        obj_type = type(obj)
+        if isinstance(class_or_tuple, tuple):
+            return any(issubclass(obj_type, cls) for cls in class_or_tuple)
+        return issubclass(obj_type, class_or_tuple)
     except Exception:
         return False
 
@@ -398,11 +465,11 @@ _MAPPING_CONTAINERS = (dict, os._Environ, MappingProxyType, UserDict)
 def is_expandable(obj: Any) -> bool:
     """Check if an object may be expanded by pretty print."""
     return (
-        _safe_isinstance(obj, _CONTAINERS)
-        or (is_dataclass(obj))
-        or (hasattr(obj, "__rich_repr__"))
+        _safe_isinstance_concrete(obj, _CONTAINERS)
+        or _is_dataclass(obj)
+        or _get_static_attribute(obj, "__rich_repr__", _MISSING) is not _MISSING
         or _is_attr_object(obj)
-    ) and not isclass(obj)
+    ) and not _is_class(obj)
 
 
 @dataclass
@@ -558,6 +625,27 @@ class _Line:
             )
 
 
+def _get_namedtuple_fields(obj: Any) -> Optional[Tuple[str, ...]]:
+    """Get statically declared namedtuple fields without invoking hooks."""
+    try:
+        obj_type = type(obj)
+        if not issubclass(obj_type, tuple):
+            return None
+        fields = _get_class_attribute(obj_type, "_fields", _MISSING)
+        if not _safe_isinstance_concrete(fields, tuple):
+            return None
+        if tuple.__len__(fields) != tuple.__len__(obj):
+            return None
+        field_names = tuple(
+            tuple.__getitem__(fields, index) for index in range(tuple.__len__(fields))
+        )
+    except Exception:
+        return None
+    if not all(type(name) is str for name in field_names):
+        return None
+    return field_names
+
+
 def _is_namedtuple(obj: Any) -> bool:
     """Checks if an object is most likely a namedtuple. It is possible
     to craft an object that passes this check and isn't a namedtuple, but
@@ -569,12 +657,7 @@ def _is_namedtuple(obj: Any) -> bool:
     Returns:
         bool: True if the object is a namedtuple. False otherwise.
     """
-    try:
-        fields = getattr(obj, "_fields", None)
-    except Exception:
-        # Being very defensive - if we cannot get the attr then its not a namedtuple
-        return False
-    return isinstance(obj, tuple) and isinstance(fields, tuple)
+    return _get_namedtuple_fields(obj) is not None
 
 
 def traverse(
@@ -646,26 +729,29 @@ def traverse(
                 else:
                     yield arg
 
-        try:
-            fake_attributes = hasattr(
-                obj, "awehoi234_wdfjwljet234_234wdfoijsdfmmnxpi492"
-            )
-        except Exception:
-            fake_attributes = False
-
-        rich_repr_result: Optional[RichReprResult] = None
-        if not fake_attributes:
+        rich_repr_args: Optional[List[Union[Any, Tuple[str, Any]]]] = None
+        rich_repr_method: Any = None
+        if (
+            not _is_class(obj)
+            and _get_static_attribute(obj, "__rich_repr__", _MISSING) is not _MISSING
+        ):
             try:
-                if hasattr(obj, "__rich_repr__") and not isclass(obj):
-                    rich_repr_result = obj.__rich_repr__()
+                rich_repr_method = getattr(obj, "__rich_repr__")
+                rich_repr_result = rich_repr_method()
+                rich_repr_args = list(iter_rich_args(rich_repr_result))
             except Exception:
                 pass
 
-        if rich_repr_result is not None:
+        namedtuple_fields = _get_namedtuple_fields(obj)
+
+        if rich_repr_args is not None:
             push_visited(obj_id)
-            angular = getattr(obj.__rich_repr__, "angular", False)
-            args = list(iter_rich_args(rich_repr_result))
-            class_name = obj.__class__.__name__
+            try:
+                angular = getattr(rich_repr_method, "angular", False)
+            except Exception:
+                angular = False
+            args = rich_repr_args
+            class_name = _get_class_name(obj)
 
             if args:
                 children = []
@@ -711,18 +797,21 @@ def traverse(
                     last=root,
                 )
             pop_visited(obj_id)
-        elif _is_attr_object(obj) and not fake_attributes:
+        elif _is_attr_object(obj):
             push_visited(obj_id)
             children = []
             append = children.append
 
-            attr_fields = _get_attr_fields(obj)
+            try:
+                attr_fields = _get_attr_fields(obj)
+            except Exception:
+                attr_fields = []
             if attr_fields:
                 if reached_max_depth:
-                    node = Node(value_repr=f"{obj.__class__.__name__}(...)")
+                    node = Node(value_repr=f"{_get_class_name(obj)}(...)")
                 else:
                     node = Node(
-                        open_brace=f"{obj.__class__.__name__}(",
+                        open_brace=f"{_get_class_name(obj)}(",
                         close_brace=")",
                         children=children,
                         last=root,
@@ -735,7 +824,13 @@ def traverse(
                         for attr in attr_fields:
                             if attr.repr:
                                 try:
-                                    value = getattr(obj, attr.name)
+                                    if (
+                                        _get_static_attribute(obj, attr.name, _MISSING)
+                                        is _MISSING
+                                    ):
+                                        value = object.__getattribute__(obj, attr.name)
+                                    else:
+                                        value = getattr(obj, attr.name)
                                 except Exception as error:
                                     # Can happen, albeit rarely
                                     yield (attr.name, error, None)
@@ -757,44 +852,56 @@ def traverse(
                         append(child_node)
             else:
                 node = Node(
-                    value_repr=f"{obj.__class__.__name__}()", children=[], last=root
+                    value_repr=f"{_get_class_name(obj)}()", children=[], last=root
                 )
             pop_visited(obj_id)
-        elif (
-            is_dataclass(obj)
-            and not _safe_isinstance(obj, type)
-            and not fake_attributes
-            and _is_dataclass_repr(obj)
-        ):
+        elif _is_dataclass(obj) and not _is_class(obj) and _is_dataclass_repr(obj):
             push_visited(obj_id)
             children = []
             append = children.append
             if reached_max_depth:
-                node = Node(value_repr=f"{obj.__class__.__name__}(...)")
+                node = Node(value_repr=f"{_get_class_name(obj)}(...)")
             else:
                 node = Node(
-                    open_brace=f"{obj.__class__.__name__}(",
+                    open_brace=f"{_get_class_name(obj)}(",
                     close_brace=")",
                     children=children,
                     last=root,
-                    empty=f"{obj.__class__.__name__}()",
+                    empty=f"{_get_class_name(obj)}()",
                 )
 
-                for last, field in loop_last(
-                    field
-                    for field in fields(obj)
-                    if field.repr and hasattr(obj, field.name)
-                ):
-                    child_node = _traverse(getattr(obj, field.name), depth=depth + 1)
+                try:
+                    dataclass_fields = fields(type(obj))
+                except Exception:
+                    dataclass_fields = ()
+
+                def iter_dataclass_fields() -> Iterable[Tuple[Any, Any]]:
+                    for field in dataclass_fields:
+                        if not field.repr:
+                            continue
+                        try:
+                            if (
+                                _get_static_attribute(obj, field.name, _MISSING)
+                                is _MISSING
+                            ):
+                                value = object.__getattribute__(obj, field.name)
+                            else:
+                                value = getattr(obj, field.name)
+                        except AttributeError:
+                            continue
+                        yield field, value
+
+                for last, (field, value) in loop_last(iter_dataclass_fields()):
+                    child_node = _traverse(value, depth=depth + 1)
                     child_node.key_repr = field.name
                     child_node.last = last
                     child_node.key_separator = "="
                     append(child_node)
 
             pop_visited(obj_id)
-        elif _is_namedtuple(obj) and _has_default_namedtuple_repr(obj):
+        elif namedtuple_fields is not None and _has_default_namedtuple_repr(obj):
             push_visited(obj_id)
-            class_name = obj.__class__.__name__
+            class_name = _get_class_name(obj)
             if reached_max_depth:
                 # If we've reached the max depth, we still show the class name, but not its contents
                 node = Node(
@@ -809,16 +916,24 @@ def traverse(
                     children=children,
                     empty=f"{class_name}()",
                 )
-                for last, (key, value) in loop_last(obj._asdict().items()):
-                    child_node = _traverse(value, depth=depth + 1)
-                    child_node.key_repr = key
-                    child_node.last = last
-                    child_node.key_separator = "="
-                    append(child_node)
+                try:
+                    namedtuple_items = [
+                        (key, tuple.__getitem__(obj, index))
+                        for index, key in enumerate(namedtuple_fields)
+                    ]
+                except (IndexError, TypeError):
+                    node = Node(value_repr=to_repr(obj), last=root)
+                else:
+                    for last, (key, value) in loop_last(namedtuple_items):
+                        child_node = _traverse(value, depth=depth + 1)
+                        child_node.key_repr = key
+                        child_node.last = last
+                        child_node.key_separator = "="
+                        append(child_node)
             pop_visited(obj_id)
-        elif _safe_isinstance(obj, _CONTAINERS):
+        elif _safe_isinstance_concrete(obj, _CONTAINERS):
             for container_type in _CONTAINERS:
-                if _safe_isinstance(obj, container_type):
+                if _safe_isinstance_concrete(obj, container_type):
                     obj_type = container_type
                     break
 
@@ -842,7 +957,7 @@ def traverse(
                 num_items = len(obj)
                 last_item_index = num_items - 1
 
-                if _safe_isinstance(obj, _MAPPING_CONTAINERS):
+                if _safe_isinstance_concrete(obj, _MAPPING_CONTAINERS):
                     iter_items = iter(obj.items())
                     if max_length is not None:
                         iter_items = islice(iter_items, max_length)
@@ -868,7 +983,7 @@ def traverse(
         else:
             node = Node(value_repr=to_repr(obj), last=root)
         node.is_tuple = type(obj) == tuple
-        node.is_namedtuple = _is_namedtuple(obj)
+        node.is_namedtuple = namedtuple_fields is not None
         return node
 
     node = _traverse(_object, root=True)
