@@ -893,6 +893,9 @@ def traverse(
                             value = getattr(obj, field.name)
                         except AttributeError:
                             continue
+                        except Exception as error:
+                            yield field, error
+                            continue
                         yield field, value
 
                 for last, (field, value) in loop_last(iter_dataclass_fields()):
