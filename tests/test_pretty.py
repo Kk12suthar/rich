@@ -524,6 +524,22 @@ def test_container_repr_probe_survives_hostile_metaclass() -> None:
     assert pretty_repr(Values([1])) == "[1]"
 
 
+def test_pretty_type_checks_do_not_compare_classes() -> None:
+    compared = []
+
+    class Meta(type):
+        def __eq__(cls, other: Any) -> bool:
+            compared.append(other)
+            raise RuntimeError("class equality was invoked")
+
+    class Value(int, metaclass=Meta):
+        def __rich_repr__(self):
+            yield "value", int(self)
+
+    assert pretty_repr(Value(7)) == "Value(value=7)"
+    assert compared == []
+
+
 def test_failing_rich_repr_iterator_falls_back_to_repr() -> None:
     accessed = []
 
