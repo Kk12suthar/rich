@@ -11,7 +11,15 @@ import pytest
 
 from rich.console import Console
 from rich.measure import Measurement
-from rich.pretty import Node, Pretty, _ipy_display_hook, install, pprint, pretty_repr
+from rich.pretty import (
+    Node,
+    Pretty,
+    _ipy_display_hook,
+    install,
+    is_expandable,
+    pprint,
+    pretty_repr,
+)
 from rich.text import Text
 
 skip_py38 = pytest.mark.skipif(
@@ -256,6 +264,282 @@ def test_pretty_namedtuple_fields_invalid_type() -> None:
     instance = LooksLikeANamedTupleButIsnt()
     result = pretty_repr(instance)
     assert result == "()"  # Treated as tuple
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_object() -> None:
+    """Feature detection must not leave the probe attributes it creates behind."""
+
+    class AutoVivifying:
+        def __getattr__(self, name: str) -> "AutoVivifying":
+            value = AutoVivifying()
+            setattr(self, name, value)
+            return value
+
+        def __repr__(self) -> str:
+            return "AutoVivifying()"
+
+    instance = AutoVivifying()
+    assert vars(instance) == {}
+
+    assert pretty_repr(instance) == "AutoVivifying()"
+    assert vars(instance) == {}
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_mapping() -> None:
+    """A dict-like object must not acquire Rich's probe names as keys."""
+
+    class AutoVivifyingDict(dict):
+        def __getattr__(self, name: str) -> "AutoVivifyingDict":
+            value = AutoVivifyingDict()
+            self[name] = value
+            return value
+
+        def __delattr__(self, name: str) -> None:
+            del self[name]
+
+    instance = AutoVivifyingDict()
+    assert pretty_repr(instance) == "{}"
+    assert instance == {}
+
+
+def test_pretty_repr_does_not_execute_failing_getattr() -> None:
+    """Static feature checks must not call an unrelated failing hook."""
+
+    accessed = []
+
+    class FailingGetattr:
+        def __getattr__(self, name: str) -> Any:
+            accessed.append(name)
+            raise RuntimeError(name)
+
+        def __repr__(self) -> str:
+            return "FailingGetattr()"
+
+    assert pretty_repr(FailingGetattr()) == "FailingGetattr()"
+    assert accessed == []
+
+
+def test_pretty_repr_does_not_execute_failing_getattribute() -> None:
+    accessed = []
+
+    class FailingGetattribute:
+        def __getattribute__(self, name: str) -> Any:
+            if name != "__repr__":
+                accessed.append(name)
+                raise RuntimeError(name)
+            return object.__getattribute__(self, name)
+
+        def __repr__(self) -> str:
+            return "FailingGetattribute()"
+
+    assert pretty_repr(FailingGetattribute()) == "FailingGetattribute()"
+    assert accessed == ["__class__"]
+
+
+def test_pretty_repr_supports_slots_without_dynamic_access() -> None:
+    """Slots are real fields, but looking for Rich protocols must stay static."""
+
+    @dataclass
+    class Slotted:
+        __slots__ = ("value",)
+
+        value: int
+
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError("unexpected attribute access: " + name)
+
+    instance = Slotted(1)
+    assert pretty_repr(instance) == "Slotted(value=1)"
+
+
+def test_namedtuple_probe_does_not_execute_dynamic_fields() -> None:
+    """A tuple subclass with a dynamic _fields must remain an ordinary tuple."""
+
+    class DynamicFieldsTuple(tuple):
+        def __getattr__(self, name: str) -> Any:
+            setattr(self, name, ("invented",))
+            return getattr(self, name)
+
+    instance = DynamicFieldsTuple((1, 2))
+    assert pretty_repr(instance) == "(1, 2)"
+    assert vars(instance) == {}
+
+
+def test_namedtuple_probe_does_not_execute_fields_descriptor() -> None:
+    """A descriptor named _fields is not evidence of a namedtuple."""
+
+    accessed = []
+
+    class FieldsDescriptor:
+        def __get__(self, instance: Any, owner: Any) -> Any:
+            accessed.append(owner)
+            raise AssertionError("_fields descriptor was executed")
+
+    class DescriptorTuple(tuple):
+        _fields = FieldsDescriptor()
+
+    assert pretty_repr(DescriptorTuple((1, 2))) == "(1, 2)"
+    assert accessed == []
+
+
+def test_namedtuple_probe_ignores_metaclass_fields() -> None:
+    """Metaclass attributes must not turn an ordinary tuple into a namedtuple."""
+
+    class Meta(type):
+        _fields = ("invented",)
+
+    class MetaclassTuple(tuple, metaclass=Meta):
+        pass
+
+    assert pretty_repr(MetaclassTuple((1,))) == "(1)"
+
+
+def test_namedtuple_probe_requires_matching_field_count() -> None:
+    """Malformed class-level metadata must not discard tuple values."""
+
+    class MalformedTuple(tuple):
+        _fields = ("first",)
+
+    assert pretty_repr(MalformedTuple((1, 2))) == "(1, 2)"
+
+
+def test_namedtuple_rendering_does_not_execute_overridden_asdict() -> None:
+    """Tuple values are available without trusting an overridden _asdict hook."""
+
+    BaseNamedTuple = collections.namedtuple("BaseNamedTuple", ["value"])
+    accessed = []
+
+    class HostileNamedTuple(BaseNamedTuple):
+        def _asdict(self) -> Any:
+            accessed.append(True)
+            raise AssertionError("_asdict hook was executed")
+
+    instance = HostileNamedTuple(1)
+    assert pretty_repr(instance) == "HostileNamedTuple(value=1)"
+    assert accessed == []
+
+
+def test_declared_rich_repr_descriptor_is_bound_only_when_rendered() -> None:
+    """Static discovery does not bind an explicitly declared Rich repr."""
+
+    accessed = []
+
+    class RichReprDescriptor:
+        def __get__(self, instance: Any, owner: Any) -> Any:
+            accessed.append("bind")
+
+            def rich_repr():
+                accessed.append("call")
+                yield "value", 1
+
+            return rich_repr
+
+    class DeclaredRepresentation:
+        __rich_repr__ = RichReprDescriptor()
+
+        def __repr__(self) -> str:
+            return "DeclaredRepresentation()"
+
+    instance = DeclaredRepresentation()
+    assert is_expandable(instance)
+    assert accessed == []
+    assert pretty_repr(instance) == "DeclaredRepresentation(value=1)"
+    assert accessed == ["bind", "call"]
+
+
+def test_failing_rich_repr_iterator_falls_back_to_repr() -> None:
+    accessed = []
+
+    class BrokenRepresentation:
+        def __rich_repr__(self):
+            accessed.append("call")
+
+            def values():
+                accessed.append("iterate")
+                raise RuntimeError("iteration failed")
+                yield  # pragma: no cover
+
+            return values()
+
+        def __repr__(self) -> str:
+            return "BrokenRepresentation()"
+
+    assert pretty_repr(BrokenRepresentation()) == "BrokenRepresentation()"
+    assert accessed == ["call", "iterate"]
+
+
+def test_dynamic_rich_repr_is_not_probed() -> None:
+    """Dynamic protocol synthesis must not run during pretty introspection."""
+
+    accessed = []
+
+    class DynamicRepresentation:
+        def __getattr__(self, name: str) -> Any:
+            accessed.append(name)
+            if name == "__rich_repr__":
+                return lambda: [("value", 1)]
+            raise AttributeError(name)
+
+        def __repr__(self) -> str:
+            return "DynamicRepresentation()"
+
+    instance = DynamicRepresentation()
+    assert pretty_repr(instance) == "DynamicRepresentation()"
+    assert accessed == []
+
+
+def test_genuine_namedtuple_variants_remain_expandable() -> None:
+    """Static _fields detection must preserve both supported namedtuple forms."""
+
+    CollectionPoint = collections.namedtuple("CollectionPoint", ["x"])
+
+    class TypedPoint(NamedTuple):
+        y: int
+
+    value = {"collection": CollectionPoint(1), "typed": TypedPoint(2)}
+    assert pretty_repr(value, max_width=200) == (
+        "{'collection': CollectionPoint(x=1), 'typed': TypedPoint(y=2)}"
+    )
+
+
+def test_nested_namedtuples_cycles_width_and_depth() -> None:
+    """Nested supported objects retain cycle, width, and depth behavior."""
+
+    CollectionNode = collections.namedtuple("CollectionNode", ["child"])
+
+    class TypedNode(NamedTuple):
+        child: Any
+
+    root = {}
+    root["collection"] = CollectionNode(root)
+    root["typed"] = TypedNode(root)
+
+    narrow = pretty_repr(root, max_width=30)
+    assert "CollectionNode(" in narrow
+    assert "TypedNode(" in narrow
+    assert narrow.count("child=...") == 2
+    assert "\n" in narrow
+
+    assert pretty_repr(root, max_width=200, max_depth=1) == (
+        "{'collection': CollectionNode(...), 'typed': TypedNode(...)}"
+    )
+
+
+def test_custom_rich_repr_is_still_used_for_nested_values() -> None:
+    accessed = []
+
+    class CustomRepresentation:
+        def __getattr__(self, name: str) -> Any:
+            accessed.append(name)
+            raise AssertionError(name)
+
+        def __rich_repr__(self):
+            yield "values", {"nested": [1, 2]}
+
+    assert pretty_repr(CustomRepresentation(), max_width=200) == (
+        "CustomRepresentation(values={'nested': [1, 2]})"
+    )
+    assert accessed == []
 
 
 def test_pretty_namedtuple_max_depth() -> None:
