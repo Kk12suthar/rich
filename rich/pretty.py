@@ -93,14 +93,6 @@ def _get_attr_fields(obj: Any) -> Sequence["_attr_module.Attribute[Any]"]:
     return tuple(tuple.__iter__(attr_fields))
 
 
-def _get_static_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
-    """Get an attribute without invoking descriptors or instance hooks."""
-    try:
-        return inspect.getattr_static(obj, name)
-    except Exception:
-        return default
-
-
 def _get_static_instance_attribute(obj: Any, name: str, default: Any = _MISSING) -> Any:
     """Get an instance or class attribute without invoking user hooks."""
     try:
