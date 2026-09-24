@@ -530,7 +530,11 @@ class _Line:
         else:
             new_line = yield _Line(text=node.open_brace, whitespace=whitespace)
         child_whitespace = self.whitespace + " " * indent_size
-        tuple_of_one = node.is_tuple and len(node.children) == 1
+        tuple_of_one = (
+            node.is_tuple
+            and not node.is_namedtuple
+            and len(node.children) == 1
+        )
         for last, child in loop_last(node.children):
             separator = "," if tuple_of_one else node.separator
             line = _Line(
@@ -558,6 +562,83 @@ class _Line:
             )
 
 
+_FAKE_ATTRIBUTE_NAME = "awehoi234_wdfjwljet234_234wdfoijsdfmmnxpi492"
+_MISSING = object()
+
+
+def _get_fake_attribute_storage(obj: Any) -> Optional[Dict[Any, Any]]:
+    """Get mapping storage without invoking dynamic attribute access."""
+    if _safe_isinstance(obj, dict):
+        return obj
+    if _safe_isinstance(obj, UserDict):
+        try:
+            data = inspect.getattr_static(obj, "data", _MISSING)
+        except Exception:
+            return None
+        if _safe_isinstance(data, dict):
+            return data
+    return None
+
+
+def _has_fake_attributes(obj: Any) -> bool:
+    """Check for dynamically generated attributes without leaving one behind."""
+    try:
+        had_attribute = (
+            inspect.getattr_static(obj, _FAKE_ATTRIBUTE_NAME, _MISSING) is not _MISSING
+        )
+    except Exception:
+        had_attribute = False
+
+    storage = _get_fake_attribute_storage(obj)
+    if storage is not None:
+        try:
+            had_attribute = had_attribute or dict.__contains__(
+                storage, _FAKE_ATTRIBUTE_NAME
+            )
+        except Exception:
+            pass
+
+    if had_attribute:
+        return True
+
+    try:
+        fake_attributes = hasattr(obj, _FAKE_ATTRIBUTE_NAME)
+    except Exception:
+        fake_attributes = False
+
+    try:
+        has_attribute = (
+            inspect.getattr_static(obj, _FAKE_ATTRIBUTE_NAME, _MISSING) is not _MISSING
+        )
+    except Exception:
+        has_attribute = False
+
+    storage = _get_fake_attribute_storage(obj)
+    if storage is not None:
+        try:
+            has_attribute = has_attribute or dict.__contains__(
+                storage, _FAKE_ATTRIBUTE_NAME
+            )
+        except Exception:
+            pass
+
+    if not had_attribute and has_attribute:
+        try:
+            delattr(obj, _FAKE_ATTRIBUTE_NAME)
+        except Exception:
+            pass
+        try:
+            instance_dict = object.__getattribute__(obj, "__dict__")
+        except Exception:
+            instance_dict = None
+        if _safe_isinstance(instance_dict, dict):
+            dict.pop(instance_dict, _FAKE_ATTRIBUTE_NAME, None)
+        if storage is not None:
+            dict.pop(storage, _FAKE_ATTRIBUTE_NAME, None)
+
+    return fake_attributes
+
+
 def _is_namedtuple(obj: Any) -> bool:
     """Checks if an object is most likely a namedtuple. It is possible
     to craft an object that passes this check and isn't a namedtuple, but
@@ -569,12 +650,14 @@ def _is_namedtuple(obj: Any) -> bool:
     Returns:
         bool: True if the object is a namedtuple. False otherwise.
     """
+    if not _safe_isinstance(obj, tuple):
+        return False
     try:
-        fields = getattr(obj, "_fields", None)
+        fields = inspect.getattr_static(obj, "_fields", _MISSING)
     except Exception:
         # Being very defensive - if we cannot get the attr then its not a namedtuple
         return False
-    return isinstance(obj, tuple) and isinstance(fields, tuple)
+    return _safe_isinstance(fields, tuple)
 
 
 def traverse(
@@ -628,6 +711,7 @@ def traverse(
 
         obj_type = type(obj)
         children: List[Node]
+        is_tuple = False
         reached_max_depth = max_depth is not None and depth >= max_depth
 
         def iter_rich_args(rich_args: Any) -> Iterable[Union[Any, Tuple[str, Any]]]:
@@ -646,12 +730,7 @@ def traverse(
                 else:
                     yield arg
 
-        try:
-            fake_attributes = hasattr(
-                obj, "awehoi234_wdfjwljet234_234wdfoijsdfmmnxpi492"
-            )
-        except Exception:
-            fake_attributes = False
+        fake_attributes = _has_fake_attributes(obj)
 
         rich_repr_result: Optional[RichReprResult] = None
         if not fake_attributes:
@@ -780,13 +859,22 @@ def traverse(
                     empty=f"{obj.__class__.__name__}()",
                 )
 
-                for last, field in loop_last(
-                    field
-                    for field in fields(obj)
-                    if field.repr and hasattr(obj, field.name)
-                ):
-                    child_node = _traverse(getattr(obj, field.name), depth=depth + 1)
-                    child_node.key_repr = field.name
+                def iter_dataclass_fields() -> Iterable[Tuple[str, Any]]:
+                    """Read visible fields once, skipping missing fields."""
+                    for field in fields(obj):
+                        if field.repr:
+                            try:
+                                value = getattr(obj, field.name)
+                            except AttributeError:
+                                continue
+                            except Exception as error:
+                                yield field.name, error
+                            else:
+                                yield field.name, value
+
+                for last, (name, value) in loop_last(iter_dataclass_fields()):
+                    child_node = _traverse(value, depth=depth + 1)
+                    child_node.key_repr = name
                     child_node.last = last
                     child_node.key_separator = "="
                     append(child_node)
@@ -821,6 +909,7 @@ def traverse(
                 if _safe_isinstance(obj, container_type):
                     obj_type = container_type
                     break
+            is_tuple = _safe_isinstance(obj, tuple)
 
             push_visited(obj_id)
 
@@ -867,7 +956,7 @@ def traverse(
             pop_visited(obj_id)
         else:
             node = Node(value_repr=to_repr(obj), last=root)
-        node.is_tuple = type(obj) == tuple
+        node.is_tuple = is_tuple
         node.is_namedtuple = _is_namedtuple(obj)
         return node
 
