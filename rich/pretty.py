@@ -859,13 +859,22 @@ def traverse(
                     empty=f"{obj.__class__.__name__}()",
                 )
 
-                for last, field in loop_last(
-                    field
-                    for field in fields(obj)
-                    if field.repr and hasattr(obj, field.name)
-                ):
-                    child_node = _traverse(getattr(obj, field.name), depth=depth + 1)
-                    child_node.key_repr = field.name
+                def iter_dataclass_fields() -> Iterable[Tuple[str, Any]]:
+                    """Read visible fields once, skipping missing fields."""
+                    for field in fields(obj):
+                        if field.repr:
+                            try:
+                                value = getattr(obj, field.name)
+                            except AttributeError:
+                                continue
+                            except Exception as error:
+                                yield field.name, error
+                            else:
+                                yield field.name, value
+
+                for last, (name, value) in loop_last(iter_dataclass_fields()):
+                    child_node = _traverse(value, depth=depth + 1)
+                    child_node.key_repr = name
                     child_node.last = last
                     child_node.key_separator = "="
                     append(child_node)

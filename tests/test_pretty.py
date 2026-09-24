@@ -205,6 +205,35 @@ def test_empty_dataclass() -> None:
     assert pretty_repr([Empty()]) == "[Empty()]"
 
 
+@pytest.mark.parametrize("error_type", [None, AttributeError, RuntimeError])
+def test_dataclass_field_access(error_type: Any) -> None:
+    accessed = []
+
+    @dataclass
+    class Example:
+        value: int
+        tail: int = 9
+
+    def read_value(instance: Any) -> int:
+        accessed.append("value")
+        if error_type is not None:
+            raise error_type("field unavailable")
+        return 7
+
+    instance = Example(1)
+    Example.value = property(read_value)
+
+    if error_type is AttributeError:
+        expected = "Example(tail=9)"
+    elif error_type is RuntimeError:
+        expected = "Example(value=RuntimeError('field unavailable'), tail=9)"
+    else:
+        expected = "Example(value=7, tail=9)"
+
+    assert pretty_repr(instance) == expected
+    assert accessed == ["value"]
+
+
 class StockKeepingUnit(NamedTuple):
     name: str
     description: str
