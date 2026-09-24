@@ -11,7 +11,16 @@ import pytest
 
 from rich.console import Console
 from rich.measure import Measurement
-from rich.pretty import Node, Pretty, _ipy_display_hook, install, pprint, pretty_repr
+from rich.pretty import (
+    Node,
+    Pretty,
+    _FAKE_ATTRIBUTE_NAME,
+    _ipy_display_hook,
+    _is_namedtuple,
+    install,
+    pprint,
+    pretty_repr,
+)
 from rich.text import Text
 
 skip_py38 = pytest.mark.skipif(
@@ -234,6 +243,16 @@ def test_pretty_namedtuple() -> None:
 def test_pretty_namedtuple_length_one_no_trailing_comma() -> None:
     instance = collections.namedtuple("Thing", ["name"])(name="Bob")
     assert pretty_repr(instance) == "Thing(name='Bob')"
+    assert pretty_repr(instance, expand_all=True) == "Thing(\n    name='Bob'\n)"
+
+    class TypedThing(NamedTuple):
+        name: str
+
+    typed_instance = TypedThing(name="Bob")
+    assert (
+        pretty_repr(typed_instance, expand_all=True)
+        == "TypedThing(\n    name='Bob'\n)"
+    )
 
 
 def test_pretty_namedtuple_empty() -> None:
@@ -256,6 +275,189 @@ def test_pretty_namedtuple_fields_invalid_type() -> None:
     instance = LooksLikeANamedTupleButIsnt()
     result = pretty_repr(instance)
     assert result == "()"  # Treated as tuple
+
+
+def test_pretty_repr_does_not_execute_namedtuple_fields_descriptor() -> None:
+    accessed = []
+
+    class FieldsDescriptor:
+        def __get__(self, instance: Any, owner: Any) -> Any:
+            accessed.append(True)
+            raise AssertionError("_fields descriptor was executed")
+
+    class TupleSubclass(tuple):
+        _fields = FieldsDescriptor()
+
+    assert pretty_repr(TupleSubclass((1,))) == "(1,)"
+    assert accessed == []
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_object() -> None:
+    class AutoVivifying:
+        def __getattr__(self, name: str) -> "AutoVivifying":
+            value = AutoVivifying()
+            setattr(self, name, value)
+            return value
+
+    instance = AutoVivifying()
+    pretty_repr(instance)
+
+    assert vars(instance) == {}
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_mapping() -> None:
+    class AutoVivifyingDict(dict):
+        def __getattr__(self, name: str) -> "AutoVivifyingDict":
+            self[name] = AutoVivifyingDict()
+            return self[name]
+
+        def __delattr__(self, name: str) -> None:
+            del self[name]
+
+    instance = AutoVivifyingDict()
+
+    assert pretty_repr(instance) == "{}"
+    assert instance == {}
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_user_dict() -> None:
+    class AutoVivifyingUserDict(UserDict):
+        def __getattr__(self, name: str) -> Any:
+            self.data[name] = "created"
+            return self.data[name]
+
+        def __delattr__(self, name: str) -> None:
+            del self.data[name]
+
+    instance = AutoVivifyingUserDict()
+
+    assert pretty_repr(instance) == "{}"
+    assert instance.data == {}
+
+
+def test_pretty_repr_preserves_existing_probe_mapping_key() -> None:
+    class OverwritingDict(dict):
+        def __getattr__(self, name: str) -> Any:
+            self[name] = "overwritten"
+            return self[name]
+
+        def __delattr__(self, name: str) -> None:
+            del self[name]
+
+    instance = OverwritingDict({_FAKE_ATTRIBUTE_NAME: "keep"})
+
+    pretty_repr(instance)
+
+    assert instance == {_FAKE_ATTRIBUTE_NAME: "keep"}
+
+
+def test_pretty_repr_removes_probe_with_noop_delattr() -> None:
+    class NoOpDelete:
+        def __getattr__(self, name: str) -> Any:
+            self.__dict__[name] = "created"
+            return self.__dict__[name]
+
+        def __delattr__(self, name: str) -> None:
+            pass
+
+        def __repr__(self) -> str:
+            return "NoOpDelete()"
+
+    instance = NoOpDelete()
+
+    assert pretty_repr(instance) == "NoOpDelete()"
+    assert vars(instance) == {}
+
+
+def test_pretty_repr_cleans_up_fake_attribute_when_getattr_raises() -> None:
+    class StoresThenRaises:
+        def __getattr__(self, name: str) -> Any:
+            if name == _FAKE_ATTRIBUTE_NAME:
+                self.__dict__[name] = True
+            raise AttributeError(name)
+
+        def __repr__(self) -> str:
+            return "StoresThenRaises()"
+
+    instance = StoresThenRaises()
+
+    assert pretty_repr(instance) == "StoresThenRaises()"
+    assert vars(instance) == {}
+
+
+def test_pretty_repr_preserves_existing_fake_attribute() -> None:
+    class HasFakeAttribute:
+        def __init__(self) -> None:
+            setattr(self, _FAKE_ATTRIBUTE_NAME, "keep")
+
+    instance = HasFakeAttribute()
+    pretty_repr(instance)
+
+    assert vars(instance) == {_FAKE_ATTRIBUTE_NAME: "keep"}
+
+
+def test_pretty_repr_does_not_mutate_auto_vivifying_tuple() -> None:
+    class AutoVivifyingTuple(tuple):
+        def __getattr__(self, name: str) -> Any:
+            value = ("invented",) if name == "_fields" else "invented"
+            setattr(self, name, value)
+            return value
+
+    instance = AutoVivifyingTuple((1,))
+
+    assert pretty_repr(instance) == "(1,)"
+    assert _is_namedtuple(instance) is False
+    assert vars(instance) == {}
+
+
+def test_pretty_repr_one_element_tuple_subclass() -> None:
+    class TupleSubclass(tuple):
+        pass
+
+    instance = TupleSubclass((1,))
+
+    assert pretty_repr(instance) == "(1,)"
+    assert pretty_repr(instance, expand_all=True) == "(\n    1,\n)"
+
+
+def test_pretty_repr_tuple_subclass_rich_repr() -> None:
+    class TupleSubclass(tuple):
+        def __rich_repr__(self):
+            yield "value", self[0]
+
+    instance = TupleSubclass((1,))
+
+    assert pretty_repr(instance) == "TupleSubclass(value=1)"
+    assert pretty_repr(instance, expand_all=True) == "TupleSubclass(\n    value=1\n)"
+
+
+def test_pretty_repr_tuple_based_objects() -> None:
+    @dataclass
+    class TupleDataclass(tuple):
+        value: int = 1
+
+    @attr.s(slots=False)
+    class TupleAttrs(tuple):
+        value = attr.ib(default=1)
+
+    for instance in (TupleDataclass(), TupleAttrs()):
+        class_name = type(instance).__name__
+        assert pretty_repr(instance) == f"{class_name}(value=1)"
+        assert pretty_repr(instance, expand_all=True) == (
+            f"{class_name}(\n    value=1\n)"
+        )
+
+
+def test_pretty_repr_nested_namedtuples_narrow_width() -> None:
+    class Inner(NamedTuple):
+        value: int
+
+    class Outer(NamedTuple):
+        inner: Inner
+
+    result = pretty_repr(Outer(Inner(1)), max_width=12)
+
+    assert result == "Outer(\n    inner=Inner(\n        value=1\n    )\n)"
 
 
 def test_pretty_namedtuple_max_depth() -> None:
